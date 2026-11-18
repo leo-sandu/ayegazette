@@ -45,60 +45,70 @@ label.keep{display:flex;align-items:center;justify-content:center;gap:8px;font-f
 <script>
 (function () {
   'use strict';
-  var KEY = 'gazette-pass', data = null, loading = null;
+  var KEY = 'gazette-pass', head = null;
   var $ = function (id) { return document.getElementById(id); };
   function msg(t) { $('msg').textContent = t; }
-  // download the locked edition (with progress), once
-  function load() {
-    if (data) return Promise.resolve(data);
-    if (loading) return loading;
-    $('bar').style.visibility = 'visible';
-    loading = fetch('page.enc', { cache: 'no-cache' }).then(function (r) {
-      if (!r.ok) throw new Error('download');
-      var total = +r.headers.get('content-length') || 0;
-      if (!r.body || !total) return r.arrayBuffer();
-      var reader = r.body.getReader(), got = 0, parts = [];
-      return (function pump() {
-        return reader.read().then(function (x) {
-          if (x.done) { var out = new Uint8Array(got), o = 0; parts.forEach(function (p) { out.set(p, o); o += p.length; }); return out.buffer; }
-          parts.push(x.value); got += x.value.length; $('barI').style.width = Math.min(100, got / total * 100).toFixed(0) + '%';
-          return pump();
-        });
-      })();
-    }).then(function (b) { data = new Uint8Array(b); $('barI').style.width = '100%'; return data; });
-    loading.catch(function () { loading = null; });
-    return loading;
-  }
+  function bar(f) { $('bar').style.visibility = 'visible'; $('barI').style.width = Math.round(f * 100) + '%'; }
+  function get(url) { return fetch(url, { cache: 'no-cache' }).then(function (r) { if (!r.ok) throw new Error('download'); return r.arrayBuffer(); }).then(function (b) { return new Uint8Array(b); }); }
+  // the small locked page header is fetched straight away, so unlocking feels instant
+  function loadHead() { if (!head) { head = get('page.enc'); head.catch(function () { head = null; }); } return head; }
+  function open(key, sealed) { return crypto.subtle.decrypt({ name: 'AES-GCM', iv: sealed.slice(0, 12) }, key, sealed.slice(12)); }
   function unlock(pw) {
-    return load().then(function (buf) {
-      if (String.fromCharCode(buf[0], buf[1], buf[2], buf[3]) !== 'AYE1') throw new Error('format');
-      var salt = buf.slice(4, 20), iv = buf.slice(20, 32), body = buf.slice(32);
+    var key;
+    return loadHead().then(function (buf) {
+      if (String.fromCharCode(buf[0], buf[1], buf[2], buf[3]) !== 'AYE2') throw new Error('format');
+      var salt = buf.slice(4, 20);
       return crypto.subtle.importKey('raw', new TextEncoder().encode(pw), 'PBKDF2', false, ['deriveKey']).then(function (base) {
         return crypto.subtle.deriveKey({ name: 'PBKDF2', salt: salt, iterations: 310000, hash: 'SHA-256' }, base, { name: 'AES-GCM', length: 256 }, false, ['decrypt']);
-      }).then(function (key) {
-        return crypto.subtle.decrypt({ name: 'AES-GCM', iv: iv }, key, body);
-      });
+      }).then(function (k) { key = k; return open(key, buf.slice(20)); });
     }).then(function (plain) {
-      return new TextDecoder().decode(plain);
+      return { key: key, page: JSON.parse(new TextDecoder().decode(plain)) };
     });
   }
-  function open(html) {
-    // replace this screen with the newspaper itself; the address stays the same
-    document.open(); document.write(html); document.close();
+  // unlock every photo into an in-memory blob URL, six at a time, with progress
+  function photos(key, list) {
+    var urls = {}, done = 0, i = 0;
+    msg('Printing the newspaper…'); bar(0);
+    return new Promise(function (resolve, reject) {
+      var active = 0, failed = false;
+      function next() {
+        if (failed) return;
+        if (i >= list.length) { if (!active) resolve(urls); return; }
+        var it = list[i++]; active++;
+        get('i/' + it[2] + '.bin').then(function (b) { return open(key, b); }).then(function (plain) {
+          urls[it[0]] = URL.createObjectURL(new Blob([plain], { type: it[1] }));
+          active--; done++; bar(done / list.length); next();
+        }).catch(function (e) { failed = true; reject(e); });
+      }
+      for (var n = 0; n < 6; n++) next();
+    });
+  }
+  // swap this screen for the newspaper in the same page, so the unlocked photos stay available
+  function show(html, urls) {
+    window.__GZIMG = urls;
+    var doc = new DOMParser().parseFromString(html, 'text/html');
+    var h = document.head; while (h.firstChild) h.removeChild(h.firstChild);
+    Array.prototype.forEach.call(doc.head.children, function (n) { if (n.tagName !== 'SCRIPT') h.appendChild(document.importNode(n, true)); });
+    document.title = doc.title;
+    document.body.className = doc.body.className; document.body.removeAttribute('style'); document.body.innerHTML = '';
+    Array.prototype.forEach.call(doc.body.childNodes, function (n) { document.body.appendChild(document.importNode(n, true)); });
+    // copied scripts never run on their own; replace each with a fresh one, in order
+    Array.prototype.forEach.call(document.body.querySelectorAll('script'), function (old) { var s = document.createElement('script'); s.textContent = old.textContent; old.parentNode.replaceChild(s, old); });
+    window.scrollTo(0, 0);
   }
   function attempt(pw, remembered) {
     $('go').disabled = true; msg(remembered ? 'Opening…' : 'Unlocking…');
-    unlock(pw).then(function (html) {
+    unlock(pw).then(function (r) {
       try { if ($('keep').checked) localStorage.setItem(KEY, pw); else localStorage.removeItem(KEY); } catch (e) {}
-      open(html);
+      return photos(r.key, r.page.img).then(function (urls) { show(r.page.html, urls); });
     }).catch(function (e) {
-      $('go').disabled = false;
+      $('go').disabled = false; $('bar').style.visibility = 'hidden';
       if (e && e.message === 'download') msg('Could not download the newspaper. Check the connection and try again.');
       else { msg(remembered ? '' : 'That password is not right. Try again.'); try { localStorage.removeItem(KEY); } catch (er) {} $('pw').value = ''; $('pw').focus(); }
     });
   }
   if (!window.crypto || !crypto.subtle) { msg('This browser cannot open the newspaper. Try Safari or Chrome.'); $('go').disabled = true; return; }
-  load().catch(function () {});
+  loadHead().catch(function () {});
   $('f').addEventListener('submit', function (e) { e.preventDefault(); var pw = $('pw').value; if (pw) attempt(pw, false); });
   var saved = null; try { saved = localStorage.getItem(KEY); } catch (e) {}
   if (saved) attempt(saved, true);
